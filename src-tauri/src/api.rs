@@ -23,13 +23,6 @@ impl Api {
         edge(&origin, "GET", path, None, token.as_deref()).await
     }
 
-    /// POST（游客也可调用，有登录态时带上 token）：新播放接口需要。
-    async fn post(&self, path: &str, body: Option<Value>) -> Result<Value, String> {
-        let origin = base();
-        let token = self.session.token(&origin);
-        edge(&origin, "POST", path, body, token.as_deref()).await
-    }
-
     async fn authed(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
         let origin = base();
         let token = self
@@ -37,6 +30,18 @@ impl Api {
             .token(&origin)
             .ok_or_else(|| "请先登录".to_string())?;
         edge(&origin, method, path, body, Some(&token)).await
+    }
+
+    async fn post_playback(&self, path: &str) -> Result<Value, String> {
+        let origin = base();
+        let token = if crate::net::trusted_auth_origin(&origin)
+            || !crate::network_policy::strict_security()
+        {
+            self.session.token(&origin)
+        } else {
+            None
+        };
+        edge(&origin, "POST", path, Some(json!({})), token.as_deref()).await
     }
 }
 
@@ -94,7 +99,7 @@ pub async fn line_probe(urls: Vec<String>) -> Result<Value, String> {
 
 /* ───────────────────────── 更新检查 ───────────────────────── */
 
-const REPO: &str = "Minireel/HGhub";
+const REPO: &str = "LNPANDY/HGhub-MacOS-iOS-Version";
 
 fn ver_parts(v: &str) -> Vec<u64> {
     v.trim()
@@ -302,7 +307,7 @@ pub fn host_info() -> Value {
 
 #[tauri::command]
 pub async fn app_boot(state: State<'_, Api>) -> Result<Value, String> {
-    let origin = base();
+    let origin = crate::lines::ensure_working_base().await;
     Ok(json!({
         "user": state.session.user(&origin),
         "logged_in": state.session.token(&origin).is_some(),
@@ -471,9 +476,86 @@ pub async fn api_posts(state: State<'_, Api>, page: u32, size: u32) -> Result<Va
         .await
 }
 
+fn non_empty_str(v: Option<&Value>) -> Option<String> {
+    v.and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn pick_stream_url(streams: Option<&Value>) -> Option<String> {
+    let streams = streams?;
+    non_empty_str(streams.get("main"))
+        .or_else(|| non_empty_str(streams.get("hevc")))
+        .or_else(|| non_empty_str(streams.get("preview")))
+}
+
+/// 将 `/api/videos/{id}/episodes/{ep}/playback` 返回的 `streams`/`cdn` 归一化为前端兼容结构。
+pub(crate) fn normalize_video_playback(mut data: Value) -> Value {
+    if let Some(cdn) = data.get("cdn") {
+        crate::net::update_cdn_auth(cdn);
+    }
+    if !data.is_object() {
+        return data;
+    }
+    if non_empty_str(data.get("video_url")).is_none() {
+        if let Some(url) = pick_stream_url(data.get("streams")) {
+            data["video_url"] = Value::String(url);
+        }
+    }
+    if non_empty_str(data.get("video_url_hevc")).is_none() {
+        if let Some(hevc) = non_empty_str(data.get("streams").and_then(|s| s.get("hevc"))) {
+            data["video_url_hevc"] = Value::String(hevc);
+        }
+    }
+    data
+}
+
+/// 将 `/api/posts/{id}/playback` 返回的视频列表/流与 CDN 鉴权回填到帖子详情中。
+pub(crate) fn normalize_post_playback(mut post: Value, playback: Option<Value>) -> Value {
+    if !post.is_object() {
+        return post;
+    }
+    if non_empty_str(post.get("video_url")).is_some() {
+        return post;
+    }
+    if let Some(pb) = playback {
+        if let Some(cdn) = pb.get("cdn") {
+            crate::net::update_cdn_auth(cdn);
+        }
+        let from_videos = pb
+            .get("videos")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.iter().find_map(|item| non_empty_str(item.get("url"))));
+        let url = from_videos
+            .or_else(|| pick_stream_url(pb.get("streams")))
+            .or_else(|| non_empty_str(pb.get("video_url")));
+        if let Some(u) = url {
+            post["video_url"] = Value::String(u);
+        }
+        if let Some(videos) = pb.get("videos") {
+            if !videos.is_null() {
+                post["videos"] = videos.clone();
+            }
+        }
+    }
+    post
+}
+
 #[tauri::command]
 pub async fn api_post(state: State<'_, Api>, id: i64) -> Result<Value, String> {
-    state.get(&format!("/api/posts/{id}")).await
+    if id <= 0 {
+        return Err("帖子 ID 无效".into());
+    }
+    let post = state.get(&format!("/api/posts/{id}")).await?;
+    if non_empty_str(post.get("video_url")).is_some() {
+        return Ok(post);
+    }
+    let playback = state
+        .post_playback(&format!("/api/posts/{id}/playback"))
+        .await
+        .ok();
+    Ok(normalize_post_playback(post, playback))
 }
 
 /* ───────────────────────── 详情 / 播放 ───────────────────────── */
@@ -483,60 +565,21 @@ pub async fn api_video(state: State<'_, Api>, id: i64) -> Result<Value, String> 
     state.get(&format!("/api/videos/{id}")).await
 }
 
-/// 新版播放接口返回 `streams.{main,hevc,preview}`，旧接口的 `video_url` 现在恒为空串。
-/// 这里把新字段回填到 `video_url` / `video_url_hevc`，前端和自检继续按原字段取流。
-fn normalize_play_info(info: &mut Value) {
-    fn non_empty(v: Option<&Value>) -> Option<String> {
-        v.and_then(|x| x.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    }
-    let main = non_empty(info.get("streams").and_then(|s| s.get("main")));
-    let hevc = non_empty(info.get("streams").and_then(|s| s.get("hevc")));
-    let Some(obj) = info.as_object_mut() else { return };
-    for (field, stream) in [("video_url", main), ("video_url_hevc", hevc)] {
-        if let Some(url) = stream {
-            if non_empty(obj.get(field)).is_none() {
-                obj.insert(field.into(), json!(url));
-            }
-        }
-    }
-}
-
-fn has_play_url(info: &Value) -> bool {
-    info.get("video_url")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
-}
-
 #[tauri::command]
 pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, String> {
-    // 优先走新接口；失败或没有可用地址时再退回旧接口，两者都不行就返回新接口的结果/错误。
-    let primary = state
-        .post(&format!("/api/videos/{id}/episodes/{ep}/playback"), Some(json!({})))
-        .await
-        .map(|mut info| {
-            normalize_play_info(&mut info);
-            info
-        });
-    if let Ok(info) = &primary {
-        if has_play_url(info) {
-            return primary;
-        }
+    if id <= 0 || ep == 0 {
+        return Err("视频 ID 或集数无效".into());
     }
     match state
-        .get(&format!("/api/videos/{id}/play?ep={ep}&page_texts=0"))
+        .post_playback(&format!("/api/videos/{id}/episodes/{ep}/playback"))
         .await
     {
-        Ok(mut legacy) => {
-            normalize_play_info(&mut legacy);
-            if has_play_url(&legacy) || primary.is_err() {
-                Ok(legacy)
-            } else {
-                primary
-            }
-        }
-        Err(_) => primary,
+        Ok(data) => Ok(normalize_video_playback(data)),
+        Err(err) if err.starts_with("HTTP 404") => state
+            .get(&format!("/api/videos/{id}/play?ep={ep}&page_texts=0"))
+            .await
+            .map(normalize_video_playback),
+        Err(err) => Err(err),
     }
 }
 
@@ -639,32 +682,8 @@ pub async fn api_post_comments(
 }
 #[cfg(test)]
 mod tests {
-    use super::{has_play_url, is_newer, normalize_play_info};
+    use super::{is_newer, normalize_post_playback, normalize_video_playback};
     use serde_json::{json, Value};
-
-    #[test]
-    fn new_playback_streams_fill_legacy_url_fields() {
-        let mut info = json!({
-            "video_url": "",
-            "streams": {"main": "https://x/main.m3u8", "hevc": "https://x/hevc.m3u8", "preview": "https://x/p.m3u8"}
-        });
-        normalize_play_info(&mut info);
-        assert_eq!(info["video_url"], "https://x/main.m3u8");
-        assert_eq!(info["video_url_hevc"], "https://x/hevc.m3u8");
-        assert!(has_play_url(&info));
-    }
-
-    #[test]
-    fn existing_video_url_is_kept_and_empty_streams_stay_empty() {
-        let mut keep = json!({"video_url": "https://old/a.m3u8", "streams": {"main": "https://x/main.m3u8"}});
-        normalize_play_info(&mut keep);
-        assert_eq!(keep["video_url"], "https://old/a.m3u8");
-
-        let mut empty = json!({"video_url": "", "streams": {"main": ""}});
-        normalize_play_info(&mut empty);
-        assert!(!has_play_url(&empty));
-        assert!(!has_play_url(&json!({"id": 1})));
-    }
 
     #[test]
     fn frontend_cannot_bypass_url_policy_with_opener_commands() {
@@ -713,5 +732,91 @@ mod tests {
         assert!(!is_newer("v1.0.1", "1.0.1"));
         assert!(!is_newer("v0.9.9", "1.0.1"));
         assert!(!is_newer("", "1.0.1"));
+    }
+
+    #[test]
+    fn normalizes_video_playback_from_streams_and_legacy_fallback() {
+        // 对齐上游 POST /api/videos/{id}/episodes/{ep}/playback 返回结构
+        let raw = json!({
+            "video_url": "",
+            "video_url_hevc": "",
+            "streams": {
+                "main": "https://cdn.example/v/12/index.m3u8",
+                "hevc": "https://cdn.example/v/12/hevc.m3u8",
+                "preview": "https://cdn.example/v/12/preview.m3u8"
+            },
+            "cdn": {
+                "m3u8Enabled": true,
+                "otherEnabled": false,
+                "authKey": "x-cdn-auth",
+                "authValue": "token-123",
+                "app": "150"
+            }
+        });
+        let normalized = normalize_video_playback(raw);
+        assert_eq!(
+            normalized["video_url"],
+            "https://cdn.example/v/12/index.m3u8"
+        );
+        assert_eq!(
+            normalized["video_url_hevc"],
+            "https://cdn.example/v/12/hevc.m3u8"
+        );
+
+        let preview_only = normalize_video_playback(json!({
+            "streams": {
+                "main": "  ",
+                "preview": "https://cdn.example/v/12/preview.m3u8"
+            }
+        }));
+        assert_eq!(
+            preview_only["video_url"],
+            "https://cdn.example/v/12/preview.m3u8"
+        );
+
+        let legacy = normalize_video_playback(json!({
+            "video_url": "https://cdn.example/legacy.m3u8",
+            "streams": {
+                "main": "https://cdn.example/v/12/index.m3u8"
+            }
+        }));
+        assert_eq!(legacy["video_url"], "https://cdn.example/legacy.m3u8");
+    }
+
+    #[test]
+    fn normalizes_post_playback_from_videos_and_preserves_inline_url() {
+        // 对齐上游 GET /api/posts/{id} (video_url="") + POST /api/posts/{id}/playback
+        let post = json!({
+            "id": 65,
+            "title": "test",
+            "video_url": ""
+        });
+        let playback = json!({
+            "videos": [
+                { "url": "https://cdn.example/post/65/index.m3u8" }
+            ],
+            "cdn": {
+                "m3u8Enabled": true,
+                "otherEnabled": true,
+                "authKey": "x-cdn-auth",
+                "authValue": "post-tok",
+                "app": "150"
+            }
+        });
+        let normalized = normalize_post_playback(post, Some(playback));
+        assert_eq!(
+            normalized["video_url"],
+            "https://cdn.example/post/65/index.m3u8"
+        );
+        assert_eq!(
+            normalized["videos"][0]["url"],
+            "https://cdn.example/post/65/index.m3u8"
+        );
+
+        let inline = normalize_post_playback(
+            json!({ "id": 65, "video_url": "https://cdn.example/inline.m3u8" }),
+            Some(json!({ "videos": [{ "url": "https://cdn.example/other.m3u8" }] })),
+        );
+        assert_eq!(inline["video_url"], "https://cdn.example/inline.m3u8");
     }
 }
